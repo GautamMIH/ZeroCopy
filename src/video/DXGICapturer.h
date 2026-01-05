@@ -6,6 +6,13 @@
 #include <functional>
 #include <thread>
 
+// Windows.Graphics.Capture API (C++/WinRT)
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+
 // Minimal includes in header to speed up compilation
 // "Forward Declarations" could be used here to reduce dependencies further
 
@@ -33,7 +40,15 @@ private:
 
     std::thread captureThread;
     bool capturing;
+    bool useWGC; // Use Windows.Graphics.Capture instead of DXGI (for Intel)
 
-    // The internal loop function
+    // Windows.Graphics.Capture objects
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem captureItem{ nullptr };
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool framePool{ nullptr };
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession captureSession{ nullptr };
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+
+    // The internal loop functions
     void CaptureLoop(FrameCallback onFrameCaptured);
+    void CaptureLoopWGC(FrameCallback onFrameCaptured);
 };

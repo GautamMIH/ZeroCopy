@@ -1,13 +1,24 @@
 #pragma once
 #include <d3d11.h>
+#include <functional>
 #include <vector>
-#include <cstdint>
 #include "VideoProcessor.h"
 
+// Media Foundation Headers
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <mferror.h>
+#include <codecapi.h> 
+#include <wrl/client.h> 
+
+using EncodedPacketCallback = std::function<void(const uint8_t* data, size_t size)>;
+
 enum class EncoderVendor {
-    NONE,
-    NVIDIA, // NVENC
-    AMD     // AMF
+    NVIDIA,
+    AMD,
+    MF_GENERIC, 
+    UNKNOWN
 };
 
 class HardwareEncoder {
@@ -15,34 +26,48 @@ public:
     HardwareEncoder();
     ~HardwareEncoder();
 
-    // Detects GPU vendor and loads the appropriate driver
     bool Initialize(ID3D11Device* device, int width, int height);
-
-    // Routes to the active encoder
-    std::vector<uint8_t> EncodeFrame(ID3D11Texture2D* texture, ID3D11DeviceContext* context);
-
-private:
-    EncoderVendor vendor = EncoderVendor::NONE;
-    int width = 0;
-    int height = 0;
-
-    VideoProcessor converter;
-
-    // --- NVIDIA State ---
-    void* nvEncoder = nullptr; // NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS*
-    void* nvFunctionList = nullptr; // NV_ENCODE_API_FUNCTION_LIST*
-    
-    // --- AMD State ---
-    void* amfContext = nullptr; // amf::AMFContext*
-    void* amfComponent = nullptr; // amf::AMFComponent*
-
-    // Internal Helpers
-    bool InitNVIDIA(ID3D11Device* device);
-    bool InitAMD(ID3D11Device* device);
-    std::vector<uint8_t> EncodeNVIDIA(ID3D11Texture2D* texture);
-    std::vector<uint8_t> EncodeAMD(ID3D11Texture2D* texture);
+    void EncodeFrame(ID3D11Texture2D* texture, ID3D11DeviceContext* context, EncodedPacketCallback onPacketReady);
     void Cleanup();
 
+private:
+    EncoderVendor vendor = EncoderVendor::UNKNOWN;
+    int width = 0;
+    int height = 0;
+    VideoProcessor converter;
+    ID3D11Device* devicePtr = nullptr; // Original capture device
+    
+    // Cross-GPU support
+    ID3D11Device* encoderDevice = nullptr; // May differ from capture device
+    ID3D11DeviceContext* encoderContext = nullptr;
+    ID3D11Texture2D* crossGPUTexture = nullptr; // Shared texture on capture device
+    ID3D11Texture2D* crossGPUTextureEncoder = nullptr; // Same texture opened on encoder device
+    ID3D11Texture2D* stagingTextureCrossGPU = nullptr; // CPU-accessible staging for cross-GPU copy
+
+    // NVIDIA
+    void* nvEncoder = nullptr;
+    void* nvFunctionList = nullptr;
     void* nvRegisteredResource = nullptr;
+    ID3D11Texture2D* nvInputTexture = nullptr; // Dedicated NV12 texture for NVENC
+    bool InitNVIDIA(ID3D11Device* device);
+    void EncodeNVIDIA(ID3D11Texture2D* texture, EncodedPacketCallback callback);
+
+    // AMD
+    void* amfContext = nullptr;
+    void* amfComponent = nullptr;
     void* amfCachedSurface = nullptr;
+    bool InitAMD(ID3D11Device* device);
+    void EncodeAMD(ID3D11Texture2D* texture, EncodedPacketCallback callback);
+
+    // GENERIC (Media Foundation / Intel)
+    Microsoft::WRL::ComPtr<IMFTransform> mfTransform;
+    Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> mfDeviceManager;
+    
+    // Staging Texture for Safe Mode (CPU Readback)
+    ID3D11Texture2D* stagingTexture = nullptr;
+    bool useCPUConversion = false; // Intel workaround flag
+
+    bool InitMF(ID3D11Device* device);
+    // Updated signature to accept DeviceContext for CPU readback
+    void EncodeMF(ID3D11Texture2D* texture, ID3D11DeviceContext* ctx, EncodedPacketCallback callback);
 };

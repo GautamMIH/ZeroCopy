@@ -6,3 +6,6 @@
 
 #obj files
 *.obj
+
+#txt files
+*.txt
