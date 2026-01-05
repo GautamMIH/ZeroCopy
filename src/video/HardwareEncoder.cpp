@@ -322,9 +322,9 @@ void HardwareEncoder::EncodeFrame(ID3D11Texture2D* texture, ID3D11DeviceContext*
     }
 
     if (vendor == EncoderVendor::NVIDIA) {
-        std::cout << "[Encoder] Encoding with NVENC..." << std::endl;
+        // std::cout << "[Encoder] Encoding with NVENC..." << std::endl;
         EncodeNVIDIA(target, onPacketReady);
-        std::cout << "[Encoder] NVENC encode completed" << std::endl;
+        // std::cout << "[Encoder] NVENC encode completed" << std::endl;
     }
     else if (vendor == EncoderVendor::AMD) EncodeAMD(target, onPacketReady);
     else if (vendor == EncoderVendor::MF_GENERIC) EncodeMF(target, context, onPacketReady);
@@ -368,7 +368,6 @@ bool HardwareEncoder::InitNVIDIA(ID3D11Device* device) {
         }
     }
     
-    std::cout << "[NVENC] DLL loaded successfully, creating encoder instance..." << std::endl;
     typedef NVENCSTATUS(NVENCAPI *NvEncCreate)(NV_ENCODE_API_FUNCTION_LIST*);
     auto createInstance = (NvEncCreate)GetProcAddress(hLib, "NvEncodeAPICreateInstance");
     if (!createInstance || createInstance(nv) != NV_ENC_SUCCESS) {
@@ -376,7 +375,6 @@ bool HardwareEncoder::InitNVIDIA(ID3D11Device* device) {
         return false;
     }
     
-    std::cout << "[NVENC] Opening encode session..." << std::endl;
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS params = { NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER };
     params.device = device;
     params.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
@@ -386,8 +384,6 @@ bool HardwareEncoder::InitNVIDIA(ID3D11Device* device) {
         std::cerr << "[NVENC] Failed to open encode session: " << openStatus << std::endl;
         return false;
     }
-    
-    std::cout << "[NVENC] Configuring encoder..." << std::endl;
     
     NV_ENC_CONFIG encodeConfig = {}; // Manual config for better compatibility
     memset(&encodeConfig, 0, sizeof(NV_ENC_CONFIG));
@@ -454,8 +450,6 @@ bool HardwareEncoder::InitNVIDIA(ID3D11Device* device) {
         return false;
     }
     
-    std::cout << "[NVENC] Created dedicated NV12 input texture" << std::endl;
-    
     // Register the dedicated texture
     NV_ENC_REGISTER_RESOURCE reg = { NV_ENC_REGISTER_RESOURCE_VER };
     reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
@@ -464,57 +458,37 @@ bool HardwareEncoder::InitNVIDIA(ID3D11Device* device) {
     reg.height = height;
     reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
     
-    std::cout << "[NVENC] Calling nvEncRegisterResource..." << std::endl;
-    
     NVENCSTATUS regStatus = nv->nvEncRegisterResource(nvEncoder, &reg);
     if (regStatus != NV_ENC_SUCCESS) {
-        std::cerr << "[NVENC] nvEncRegisterResource FAILED with status: " << regStatus << std::endl;
+        std::cerr << "[NVENC] Register resource failed: " << regStatus << std::endl;
         return false;
     }
     nvRegisteredResource = reg.registeredResource;
     
-    std::cout << "[NVENC] Resource registered, handle: " << nvRegisteredResource << std::endl;
-    
-    std::cout << "[NVENC] Initialized successfully with dedicated input texture" << std::endl;
+    std::cout << "[NVENC] Initialized successfully" << std::endl;
     return true;
 }
 
 void HardwareEncoder::EncodeNVIDIA(ID3D11Texture2D* texture, EncodedPacketCallback callback) {
-    std::cout << "[NVENC] EncodeNVIDIA called" << std::endl;
-    
     auto nv = static_cast<NV_ENCODE_API_FUNCTION_LIST*>(nvFunctionList);
-    
-    std::cout << "[NVENC] Copying NV12 texture to dedicated input..." << std::endl;
     
     // Copy converted NV12 texture to dedicated NVENC input texture
     if (encoderDevice) {
-        std::cout << "[NVENC] Using encoder context for copy" << std::endl;
         encoderContext->CopyResource(nvInputTexture, texture);
     } else {
-        std::cout << "[NVENC] Using capture device context for copy" << std::endl;
         ComPtr<ID3D11DeviceContext> ctx;
         devicePtr->GetImmediateContext(&ctx);
         ctx->CopyResource(nvInputTexture, texture);
     }
     
-    std::cout << "[NVENC] Copy completed, mapping input resource..." << std::endl;
-    std::cout << "[NVENC] Registered resource handle: " << nvRegisteredResource << std::endl;
-    
     NV_ENC_MAP_INPUT_RESOURCE map = { NV_ENC_MAP_INPUT_RESOURCE_VER };
     map.registeredResource = nvRegisteredResource;
     
-    std::cout << "[NVENC] About to call nvEncMapInputResource (may crash here)..." << std::endl;
-    
     NVENCSTATUS mapStatus = nv->nvEncMapInputResource(nvEncoder, &map);
-    
-    std::cout << "[NVENC] nvEncMapInputResource returned: " << mapStatus << std::endl;
-    
     if (mapStatus != NV_ENC_SUCCESS) {
-        std::cerr << "[NVENC] nvEncMapInputResource FAILED: " << mapStatus << std::endl;
+        std::cerr << "[NVENC] Map failed: " << mapStatus << std::endl;
         return;
     }
-    
-    std::cout << "[NVENC] Map succeeded, creating bitstream buffer..." << std::endl;
     
     NV_ENC_CREATE_BITSTREAM_BUFFER bitbuf = { NV_ENC_CREATE_BITSTREAM_BUFFER_VER };
     nv->nvEncCreateBitstreamBuffer(nvEncoder, &bitbuf);
@@ -531,14 +505,14 @@ void HardwareEncoder::EncodeNVIDIA(ID3D11Texture2D* texture, EncodedPacketCallba
     if (nvFrameCount == 1) pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
     
     NVENCSTATUS encStatus = nv->nvEncEncodePicture(nvEncoder, &pic);
-    std::cout << "[NVENC] nvEncEncodePicture returned: " << encStatus << std::endl;
+    // std::cout << "[NVENC] nvEncEncodePicture returned: " << encStatus << std::endl;
     
-    std::cout << "[NVENC] Locking bitstream..." << std::endl;
+    // std::cout << "[NVENC] Locking bitstream..." << std::endl;
     
     NV_ENC_LOCK_BITSTREAM lock = { NV_ENC_LOCK_BITSTREAM_VER };
     lock.outputBitstream = bitbuf.bitstreamBuffer;
     if (nv->nvEncLockBitstream(nvEncoder, &lock) == NV_ENC_SUCCESS) {
-        std::cout << "[NVENC] Bitstream locked, size: " << lock.bitstreamSizeInBytes << " bytes" << std::endl;
+        // std::cout << "[NVENC] Bitstream locked, size: " << lock.bitstreamSizeInBytes << " bytes" << std::endl;
         if (lock.bitstreamSizeInBytes > 0) callback((const uint8_t*)lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
         nv->nvEncUnlockBitstream(nvEncoder, lock.outputBitstream);
     }
@@ -568,9 +542,11 @@ bool HardwareEncoder::InitAMD(ID3D11Device* device) {
     component->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, 30000000);
     component->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, ::AMFConstructSize(width, height));
     component->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(60, 1));
-    component->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, 0); 
+    component->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, 60); // Insert IDR with headers every 60 frames
+    component->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, 60); // Insert headers every 60 frames
     if (component->Init(amf::AMF_SURFACE_NV12, width, height) != AMF_OK) return false;
     amfComponent = new amf::AMFComponentPtr(component);
+    std::cout << "[Encoder] AMF encoder initialized with header insertion" << std::endl;
     return true;
 }
 

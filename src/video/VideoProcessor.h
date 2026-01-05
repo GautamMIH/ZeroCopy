@@ -11,7 +11,9 @@ class VideoProcessor {
 public:
     bool Initialize(ID3D11Device* device, int width, int height) {
         inputViewCache.clear();
-        devicePtr = device; 
+        devicePtr = device;
+        displayWidth = width;
+        displayHeight = height;
 
         if (FAILED(device->QueryInterface(__uuidof(ID3D11VideoDevice), (void**)&videoDevice))) return false;
         
@@ -50,7 +52,7 @@ public:
 
     ID3D11Texture2D* Convert(ID3D11Texture2D* inputTexture) {
         if (!videoContext || !processor || !inputTexture) {
-            std::cerr << "[VideoProcessor] Convert: NULL input detected" << std::endl;
+            // std::cerr << "[VideoProcessor] Convert: NULL input detected" << std::endl;
             return nullptr;
         }
         
@@ -105,9 +107,10 @@ public:
             D3D11_TEXTURE2D_DESC srcDesc;
             nv12Texture->GetDesc(&srcDesc);
 
+            // Create output texture at DISPLAY size (not aligned size)
             D3D11_TEXTURE2D_DESC newDesc = {}; 
-            newDesc.Width = srcDesc.Width;
-            newDesc.Height = srcDesc.Height;
+            newDesc.Width = displayWidth;  // Use actual display dimensions
+            newDesc.Height = displayHeight;
             newDesc.MipLevels = 1;
             newDesc.ArraySize = 1;
             newDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; 
@@ -124,11 +127,22 @@ public:
             D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outViewDesc = {};
             outViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
             videoDevice->CreateVideoProcessorOutputView(bgraTexture.Get(), videoEnum.Get(), &outViewDesc, &bgraOutputView);
+            
+            std::cout << "[VideoProcessor] Created BGRA output: " << displayWidth << "x" << displayHeight 
+                      << " (input was " << srcDesc.Width << "x" << srcDesc.Height << ")" << std::endl;
         }
 
         ID3D11VideoProcessorInputView* pInputView = GetCachedInputView(nv12Texture);
         if (!pInputView) return nullptr;
 
+        // Set source rectangle to crop aligned padding (1088 -> 1080)
+        RECT srcRect = { 0, 0, (LONG)displayWidth, (LONG)displayHeight };
+        videoContext->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &srcRect);
+        
+        // Set destination rectangle to match output
+        RECT dstRect = { 0, 0, (LONG)displayWidth, (LONG)displayHeight };
+        videoContext->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &dstRect);
+        
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable = TRUE;
         stream.pInputSurface = pInputView; 
@@ -150,6 +164,9 @@ private:
 
     ComPtr<ID3D11Texture2D> bgraTexture;
     ComPtr<ID3D11VideoProcessorOutputView> bgraOutputView;
+    
+    UINT displayWidth = 0;
+    UINT displayHeight = 0;
 
     std::map<ID3D11Texture2D*, ComPtr<ID3D11VideoProcessorInputView>> inputViewCache;
 

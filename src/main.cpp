@@ -2,7 +2,7 @@
 #include <windows.h>
 #include "video/DXGICapturer.h"
 #include "video/HardwareEncoder.h"
-#include "video/H264Decoder.h" 
+#include "video/HardwareDecoder.h" 
 #include "WindowRenderer.h"
 #include "video/VideoProcessor.h"
 
@@ -31,7 +31,7 @@ int main() {
 
     DXGICapturer capturer;
     HardwareEncoder encoder;
-    H264Decoder decoder;
+    HardwareDecoder decoder;
     WindowRenderer renderer(hwnd);
     VideoProcessor displayConverter; 
 
@@ -46,9 +46,9 @@ int main() {
             encoder.Initialize(dev.Get(), desc.Width, desc.Height);
             decoder.Initialize(dev.Get(), desc.Width, desc.Height);
             renderer.Initialize(dev.Get(), desc.Width, desc.Height);
-            displayConverter.Initialize(dev.Get(), desc.Width, desc.Height);
+            displayConverter.Initialize(dev.Get(), desc.Width, desc.Height); // Display size
             
-            std::cout << "[System] Ready." << std::endl;
+            std::cout << "[System] Ready. Display: " << desc.Width << "x" << desc.Height << std::endl;
             initDone = true;
         }
 
@@ -67,9 +67,9 @@ int main() {
 
             std::cout << "\rPkt(" << size << "|T:" << nalType << ")";
 
-
+                // Decode returns output immediately (after pipeline is primed)
                 ID3D11Texture2D* decodedNV12 = decoder.Decode(data, size, ctx);
-
+                
                 if (decodedNV12) {
                     // STATUS: Decoded
                     std::cout << "-DEC"; 
