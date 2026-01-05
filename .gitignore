@@ -1,0 +1,8 @@
+# Visual Studio Code settings
+.vscode/*
+
+#exe files
+*.exe
+
+#obj files
+*.obj
