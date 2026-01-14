@@ -61,7 +61,7 @@
 #include <wrl/client.h>
 #include <functional>
 #include <thread>
-#include <atomic> // Added for thread safety flags
+#include <atomic>
 
 // Windows.Graphics.Capture API (C++/WinRT)
 #include <winrt/Windows.Foundation.h>
@@ -70,7 +70,8 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 
-using FrameCallback = std::function<void(ID3D11Texture2D*, ID3D11DeviceContext*)>;
+// Callback now includes cursor position (POINT)
+using FrameCallback = std::function<void(ID3D11Texture2D*, ID3D11DeviceContext*, POINT)>;
 
 class DXGICapturer {
 public:
@@ -87,12 +88,11 @@ private:
     D3D_FEATURE_LEVEL featureLevel;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> deskDupl;
     
-    // --- NEW: Heartbeat Cache ---
+    // Heartbeat: Caches the last valid frame
     Microsoft::WRL::ComPtr<ID3D11Texture2D> lastFrameCache; 
-    // ----------------------------
 
     std::thread captureThread;
-    std::atomic<bool> capturing; // Changed to atomic for safety
+    std::atomic<bool> capturing; 
     bool useWGC; 
 
     // Windows.Graphics.Capture objects

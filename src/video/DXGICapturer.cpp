@@ -245,10 +245,13 @@ void DXGICapturer::Stop() {
     }
 }
 
+// --------------------------------------------------------------------------------
+// CORE CAPTURE LOOP (Updated with Heartbeat + Cursor)
+// --------------------------------------------------------------------------------
 void DXGICapturer::CaptureLoop(FrameCallback onFrameCaptured) {
     HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    // 60 FPS Target
-    const auto FRAME_DURATION = std::chrono::microseconds(1000000 / 60);
+    // 60 FPS Target (16.66ms per frame)
+    const auto FRAME_DURATION = std::chrono::microseconds(16666);
     auto nextFrameTime = std::chrono::steady_clock::now();
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
@@ -256,62 +259,91 @@ void DXGICapturer::CaptureLoop(FrameCallback onFrameCaptured) {
     ComPtr<ID3D11Texture2D> acquiredImage;
     
     int successCount = 0;
-    int timeoutCount = 0;
     int errorCount = 0;
+    
+    // Cache current cursor to send during heartbeats
+    POINT lastCursorPos = { -1, -1 };
 
-    std::cout << "[Capturer] Capture loop started..." << std::endl;
+    std::cout << "[Capturer] Capture loop started (Heartbeat Enabled)..." << std::endl;
 
     while (capturing) {
         nextFrameTime += FRAME_DURATION;
 
         // 1. Acquire the raw desktop frame
-        // Use 16ms timeout (one frame) to get updates
-        HRESULT hr = deskDupl->AcquireNextFrame(16, &frameInfo, &desktopResource);
+        // Reduced timeout to 10ms to allow us to control the 60FPS heartbeat manually
+        HRESULT hr = deskDupl->AcquireNextFrame(10, &frameInfo, &desktopResource);
 
         if (SUCCEEDED(hr)) {
             successCount++;
             
             // SKIP THE FIRST FRAME (it's often empty/uninitialized)
             if (successCount == 1) {
-                std::cout << "[Capturer] Skipping first frame (usually empty)" << std::endl;
                 deskDupl->ReleaseFrame();
                 continue;
             }
             
-            // Log first few successful captures
-            if (successCount <= 6) {
-                std::cout << "[Capturer] Frame acquired #" << successCount 
-                         << " | LastPresentTime: " << frameInfo.LastPresentTime.QuadPart
-                         << " | AccumulatedFrames: " << frameInfo.AccumulatedFrames << std::endl;
+            // --- CURSOR EXTRACTION ---
+            POINT cursorPos = { -1, -1 };
+            // Check if cursor metadata is valid
+            if (frameInfo.LastMouseUpdateTime.QuadPart > 0 || frameInfo.PointerPosition.Visible) {
+                cursorPos = frameInfo.PointerPosition.Position;
+                // If not visible, hide it
+                if (!frameInfo.PointerPosition.Visible) {
+                    cursorPos = { -1, -1 };
+                }
+                // Update our cache
+                lastCursorPos = cursorPos;
+            } else {
+                // If no update, use the last known position
+                cursorPos = lastCursorPos;
             }
-            
+            // -------------------------
+
             // 2. Get the Texture Interface
             if (SUCCEEDED(desktopResource.As(&acquiredImage))) {
                 
+                // --- HEARTBEAT CACHE UPDATE ---
+                // We create a copy of the valid frame so we can resend it if the screen stops updating
+                if (!lastFrameCache) {
+                    D3D11_TEXTURE2D_DESC desc;
+                    acquiredImage->GetDesc(&desc);
+                    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    desc.MiscFlags = 0; // Ensure no incompatible flags
+                    device->CreateTexture2D(&desc, nullptr, &lastFrameCache);
+                }
+                
+                if (lastFrameCache) {
+                    context->CopyResource(lastFrameCache.Get(), acquiredImage.Get());
+                }
+                // ------------------------------
+                
                 // 3. ZERO COPY SHORTCUT:
-                // We pass the raw desktop texture directly to the callback.
-                // The callback runs the Converter (Blt) immediately.
-                // The GPU command is queued.
-                onFrameCaptured(acquiredImage.Get(), context.Get());
+                // Pass the raw desktop texture + cursor position
+                onFrameCaptured(acquiredImage.Get(), context.Get(), cursorPos);
             }
 
-            // 4. Release (Give it back to the OS)
-            // It is safe to release here because the GPU commands (Conversion) 
-            // from the callback have already been submitted to the Context.
+            // 4. Release immediately
             deskDupl->ReleaseFrame();
         }
         else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            timeoutCount++;
-            if (timeoutCount <= 3) {
-                std::cout << "[Capturer] Timeout (no screen update)" << std::endl;
+            // --- HEARTBEAT LOGIC ---
+            // The screen hasn't changed (static).
+            // We MUST send a frame to keep the decoder's buffer flushing.
+            
+            if (lastFrameCache) {
+                // Send the cached (previous) frame + last known cursor
+                onFrameCaptured(lastFrameCache.Get(), context.Get(), lastCursorPos);
+            } else {
+                // Very start of stream, no cache yet
+                onFrameCaptured(nullptr, context.Get(), lastCursorPos);
             }
-            // No screen update (desktop is static). 
-            // Send nullptr to re-encode last frame
-            onFrameCaptured(nullptr, context.Get());
         }
         else if (hr == DXGI_ERROR_ACCESS_LOST) {
             std::cerr << "[Capturer] ERROR: Access lost (resolution change or UAC?)" << std::endl;
             errorCount++;
+            // In a production app, you would re-run Initialize() here.
+            // For now, we break to avoid an infinite error loop.
+            break; 
         }
         else {
             if (errorCount < 5) {
@@ -322,6 +354,7 @@ void DXGICapturer::CaptureLoop(FrameCallback onFrameCaptured) {
 
         std::this_thread::sleep_until(nextFrameTime);
     }
+    
     if (SUCCEEDED(coInit)) {
         CoUninitialize();
     }
@@ -365,13 +398,15 @@ void DXGICapturer::CaptureLoopWGC(FrameCallback onFrameCaptured) {
                 }
                 
                 // ZERO COPY: Pass texture directly to encoder
-                onFrameCaptured(texture.Get(), context.Get());
+                // WGC captures cursor by default, so we pass {-1, -1} to avoid drawing a second one
+                onFrameCaptured(texture.Get(), context.Get(), { -1, -1 });
             }
             
             frame.Close();
         } else {
-            // No new frame available, send nullptr to re-encode last frame
-            onFrameCaptured(nullptr, context.Get());
+            // No new frame available
+            // WGC handles its own timing better, but we can send nullptr to signal "no change"
+            onFrameCaptured(nullptr, context.Get(), { -1, -1 });
         }
         
         std::this_thread::sleep_until(nextFrameTime);
@@ -381,4 +416,3 @@ void DXGICapturer::CaptureLoopWGC(FrameCallback onFrameCaptured) {
         CoUninitialize();
     }
 }
-

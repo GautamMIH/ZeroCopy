@@ -24,7 +24,7 @@
 enum class AppState { MENU, HOSTING, CONNECTING, STREAMING };
 AppState g_State = AppState::MENU;
 
-// D3D11 Globals for Main Window
+// D3D11 Globals
 ID3D11Device* g_pd3dDevice = nullptr;
 ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 IDXGISwapChain* g_pSwapChain = nullptr;
@@ -35,22 +35,21 @@ NetworkManager g_Net;
 int g_Socket = -1;
 std::string g_StatusMsg = "Ready";
 
-// Host Globals
+// Host
 DXGICapturer g_Capturer;
 HardwareEncoder g_Encoder;
 size_t g_BytesSent = 0;
 
-// Client Globals
+// Client
 HardwareDecoder g_Decoder;
 VideoProcessor g_Converter;
 ID3D11Texture2D* g_DisplayTexture = nullptr; 
-ID3D11ShaderResourceView* g_DisplaySRV = nullptr; // <--- CRITICAL FIX: The View ImGui needs
+ID3D11ShaderResourceView* g_DisplaySRV = nullptr; 
+POINT g_RemoteCursor = { -1, -1 };
 bool g_ClientInit = false;
 
-// Forward declare ImGui handler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// --- D3D11 Helper Functions ---
 bool CreateDeviceD3D(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 2;
@@ -73,7 +72,6 @@ bool CreateDeviceD3D(HWND hWnd) {
         featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext)))
         return false;
 
-    // Create Render Target
     ID3D11Texture2D* pBackBuffer;
     g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
     g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
@@ -86,14 +84,11 @@ void CleanupDeviceD3D() {
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
-    
-    // Cleanup Global SRV
     if (g_DisplaySRV) { g_DisplaySRV->Release(); g_DisplaySRV = nullptr; }
 }
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
-    
     switch (msg) {
     case WM_SIZE:
         if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
@@ -105,39 +100,30 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             pBackBuffer->Release();
         }
         return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-// --- Main Application Loop ---
 int main(int, char**) {
-    // Create Application Window
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, _T("DXGI Streamer"), nullptr };
     RegisterClassEx(&wc);
     HWND hwnd = CreateWindow(wc.lpszClassName, _T("DXGI Zero Copy Streamer"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
 
-    // Initialize Direct3D
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
         UnregisterClass(wc.lpszClassName, wc.hInstance);
         return 1;
     }
-
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
-    // Setup ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Main loop
     bool done = false;
     while (!done) {
         MSG msg;
@@ -148,55 +134,42 @@ int main(int, char**) {
         }
         if (done) break;
 
-        // --- Logic Update Step ---
-        if (g_State == AppState::HOSTING) {
-            // Logic handled by callbacks, just update stats here if needed
-        }
-        else if (g_State == AppState::CONNECTING) {
+        // --- Logic ---
+        if (g_State == AppState::CONNECTING) {
              int sock = -1;
              if (g_Net.FindAndConnect(sock)) {
                  g_Socket = sock;
                  g_State = AppState::STREAMING;
-                 g_StatusMsg = "Connected! Receiving stream...";
+                 g_StatusMsg = "Connected!";
              } else {
                  g_State = AppState::MENU; 
-                 g_StatusMsg = "Connection timed out or not found.";
+                 g_StatusMsg = "Connection timeout.";
              }
         }
         else if (g_State == AppState::STREAMING) {
-            // CLIENT LOGIC: Poll Network
             if (g_Net.IsDataAvailable(g_Socket)) {
-                uint32_t size = 0;
+                PacketHeader header;
                 static std::vector<uint8_t> buffer;
                 
-                if (g_Net.ReceiveHeader(g_Socket, size)) {
-                    if (g_Net.ReceiveBody(g_Socket, buffer, size)) {
+                if (g_Net.ReceiveHeader(g_Socket, header)) {
+                    if (g_Net.ReceiveBody(g_Socket, buffer, header.frameSize)) {
                         
-                        // First Frame Init
+                        g_RemoteCursor.x = header.cursorX;
+                        g_RemoteCursor.y = header.cursorY;
+
                         if (!g_ClientInit) {
-                            g_Decoder.Initialize(g_pd3dDevice, 1920, 1080); // Assume 1080p
+                            g_Decoder.Initialize(g_pd3dDevice, 1920, 1080);
                             g_Converter.Initialize(g_pd3dDevice, 1920, 1080);
                             g_ClientInit = true;
                         }
 
-                        // Decode & Convert
-                        ID3D11Texture2D* decoded = g_Decoder.Decode(buffer.data(), size, g_pd3dDeviceContext);
+                        ID3D11Texture2D* decoded = g_Decoder.Decode(buffer.data(), header.frameSize, g_pd3dDeviceContext);
                         if (decoded) {
                             ID3D11Texture2D* newTex = g_Converter.ConvertNV12ToBGRA(decoded);
-                            
-                            // Check if the texture pointer changed or if we haven't created the View yet
                             if (newTex && newTex != g_DisplayTexture) {
                                 g_DisplayTexture = newTex;
-                                
-                                // Release old view if it exists
                                 if (g_DisplaySRV) { g_DisplaySRV->Release(); g_DisplaySRV = nullptr; }
-                                
-                                // Create NEW Shader Resource View
-                                // This allows ImGui to "see" the texture
-                                HRESULT hr = g_pd3dDevice->CreateShaderResourceView(g_DisplayTexture, nullptr, &g_DisplaySRV);
-                                if (FAILED(hr)) {
-                                    std::cerr << "Failed to create SRV for ImGui!" << std::endl;
-                                }
+                                g_pd3dDevice->CreateShaderResourceView(g_DisplayTexture, nullptr, &g_DisplaySRV);
                             }
                         }
                     }
@@ -209,24 +182,43 @@ int main(int, char**) {
             }
         }
 
-        // --- Rendering Step ---
+        // --- Rendering ---
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // 1. Draw Video Background (Client Only)
-        // CRITICAL FIX: We pass g_DisplaySRV (the View), NOT g_DisplayTexture
         if (g_State == AppState::STREAMING && g_DisplaySRV) {
-            // Get Window Size
             RECT rect; GetClientRect(hwnd, &rect);
             float w = (float)(rect.right - rect.left);
             float h = (float)(rect.bottom - rect.top);
+            auto drawList = ImGui::GetBackgroundDrawList();
             
-            // Draw Texture as Background
-            ImGui::GetBackgroundDrawList()->AddImage((void*)g_DisplaySRV, ImVec2(0,0), ImVec2(w,h));
+            // Video Background
+            drawList->AddImage((void*)g_DisplaySRV, ImVec2(0,0), ImVec2(w,h));
+
+            // Cursor Overlay
+            // Cursor Overlay - NEW REALISTIC CURSOR
+            if (g_RemoteCursor.x != -1) {
+                float scaleX = w / 1920.0f; // Scale assuming 1080p source
+                float scaleY = h / 1080.0f;
+                
+                float baseX = g_RemoteCursor.x * scaleX;
+                float baseY = g_RemoteCursor.y * scaleY;
+                float cursorSize = 16.0f; // Size of the arrow
+
+                // Define the three points of a standard cursor arrow
+                ImVec2 p1(baseX, baseY); // Tip
+                ImVec2 p2(baseX, baseY + cursorSize);
+                ImVec2 p3(baseX + cursorSize * 0.75f, baseY + cursorSize * 0.75f);
+
+                // 1. Draw White Filled Arrow
+                drawList->AddTriangleFilled(p1, p2, p3, IM_COL32(255, 255, 255, 255));
+                
+                // 2. Draw Black Outline (for visibility on light backgrounds)
+                drawList->AddTriangle(p1, p2, p3, IM_COL32(0, 0, 0, 255), 1.5f);
+            }       
         }
 
-        // 2. Draw UI Window
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
         
@@ -236,19 +228,16 @@ int main(int, char**) {
 
         if (g_State == AppState::MENU) {
             if (ImGui::Button("HOST STREAM", ImVec2(280, 50))) {
-                g_StatusMsg = "Waiting for client connection...";
-                
+                g_StatusMsg = "Waiting for client...";
                 std::thread hostThread([&]() {
                     int clientSock = -1;
                     if (g_Net.WaitForReceiver(clientSock)) {
                         g_Socket = clientSock;
                         g_State = AppState::HOSTING;
-                        g_StatusMsg = "Client Connected! Streaming...";
-                        
-                        // Start Capture Engine
+                        g_StatusMsg = "Streaming...";
                         static bool encInit = false;
                         g_Capturer.Initialize();
-                        g_Capturer.Start([&](ID3D11Texture2D* tex, ID3D11DeviceContext* ctx) {
+                        g_Capturer.Start([&](ID3D11Texture2D* tex, ID3D11DeviceContext* ctx, POINT pt) {
                             if (!encInit) {
                                 D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
                                 ComPtr<ID3D11Device> dev; ctx->GetDevice(&dev);
@@ -256,39 +245,34 @@ int main(int, char**) {
                                 encInit = true;
                             }
                             g_Encoder.EncodeFrame(tex, ctx, [&](const uint8_t* data, size_t size) {
-                                g_Net.SendFrame(g_Socket, data, size);
+                                g_Net.SendFrame(g_Socket, data, size, pt.x, pt.y);
                                 g_BytesSent += size;
                             });
                         });
                     } else {
-                        g_StatusMsg = "Hosting failed (Bind error?)";
+                        g_StatusMsg = "Hosting failed.";
                     }
                 });
                 hostThread.detach();
             }
-
             if (ImGui::Button("JOIN STREAM", ImVec2(280, 50))) {
-                g_StatusMsg = "Searching for local streams...";
+                g_StatusMsg = "Searching...";
                 g_State = AppState::CONNECTING; 
             }
         }
         else if (g_State == AppState::HOSTING) {
-            ImGui::Text("Mode: SENDER");
-            ImGui::Text("Data Sent: %.2f MB", g_BytesSent / 1024.0f / 1024.0f);
+            ImGui::Text("Sent: %.2f MB", g_BytesSent / 1024.0f / 1024.0f);
             if (ImGui::Button("Stop Hosting")) {
                 g_Capturer.Stop();
                 g_State = AppState::MENU;
-                g_StatusMsg = "Stopped.";
                 g_BytesSent = 0;
             }
         }
         else if (g_State == AppState::STREAMING) {
-            ImGui::Text("Mode: RECEIVER");
             if (ImGui::Button("Disconnect")) {
                 closesocket(g_Socket);
                 g_Socket = -1;
                 g_State = AppState::MENU;
-                g_StatusMsg = "Disconnected.";
             }
         }
 
@@ -298,9 +282,7 @@ int main(int, char**) {
         float clearColor[] = { 0.1f, 0.1f, 0.1f, 1.0f };
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clearColor);
-        
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
         g_pSwapChain->Present(1, 0);
     }
 
@@ -310,6 +292,5 @@ int main(int, char**) {
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);
-
     return 0;
 }
