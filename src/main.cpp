@@ -17,6 +17,8 @@
 #include "video/HardwareEncoder.h"
 #include "video/HardwareDecoder.h" 
 #include "video/VideoProcessor.h"
+#include "audio/AudioCapturer.h" 
+#include "audio/AudioPlayer.h"   
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -38,11 +40,19 @@ std::string g_StatusMsg = "Ready";
 // Host
 DXGICapturer g_Capturer;
 HardwareEncoder g_Encoder;
+AudioCapturer g_AudioCap;
 size_t g_BytesSent = 0;
+
+
+// Audio Selection
+std::vector<AudioDeviceInfo> g_AudioDevices;
+int g_SelectedAudioIndex = 0;
+
 
 // Client
 HardwareDecoder g_Decoder;
 VideoProcessor g_Converter;
+AudioPlayer g_AudioPlay;
 ID3D11Texture2D* g_DisplayTexture = nullptr; 
 ID3D11ShaderResourceView* g_DisplaySRV = nullptr; 
 POINT g_RemoteCursor = { -1, -1 };
@@ -110,11 +120,7 @@ int main(int, char**) {
     RegisterClassEx(&wc);
     HWND hwnd = CreateWindow(wc.lpszClassName, _T("DXGI Zero Copy Streamer"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
 
-    if (!CreateDeviceD3D(hwnd)) {
-        CleanupDeviceD3D();
-        UnregisterClass(wc.lpszClassName, wc.hInstance);
-        return 1;
-    }
+    if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClass(wc.lpszClassName, wc.hInstance); return 1; }
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
@@ -123,6 +129,9 @@ int main(int, char**) {
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Initial Audio Enumeration
+    g_AudioDevices = g_AudioCap.EnumerateDevices();
 
     bool done = false;
     while (!done) {
@@ -134,107 +143,126 @@ int main(int, char**) {
         }
         if (done) break;
 
-        // --- Logic ---
+        // --- LOGIC ---
         if (g_State == AppState::CONNECTING) {
              int sock = -1;
              if (g_Net.FindAndConnect(sock)) {
                  g_Socket = sock;
                  g_State = AppState::STREAMING;
                  g_StatusMsg = "Connected!";
+                 // Init Audio Player
+                 g_AudioPlay.Initialize();
              } else {
                  g_State = AppState::MENU; 
                  g_StatusMsg = "Connection timeout.";
              }
         }
         else if (g_State == AppState::STREAMING) {
-            if (g_Net.IsDataAvailable(g_Socket)) {
+            // Check for data loop
+            while (g_Net.IsDataAvailable(g_Socket)) {
                 PacketHeader header;
-                static std::vector<uint8_t> buffer;
-                
                 if (g_Net.ReceiveHeader(g_Socket, header)) {
-                    if (g_Net.ReceiveBody(g_Socket, buffer, header.frameSize)) {
+                    static std::vector<uint8_t> buffer;
+                    if (g_Net.ReceiveBody(g_Socket, buffer, header.payloadSize)) {
                         
-                        g_RemoteCursor.x = header.cursorX;
-                        g_RemoteCursor.y = header.cursorY;
+                        if (header.packetType == PACKET_TYPE_VIDEO) {
+                            // --- HANDLE VIDEO ---
+                            g_RemoteCursor.x = header.cursorX;
+                            g_RemoteCursor.y = header.cursorY;
 
-                        if (!g_ClientInit) {
-                            g_Decoder.Initialize(g_pd3dDevice, 1920, 1080);
-                            g_Converter.Initialize(g_pd3dDevice, 1920, 1080);
-                            g_ClientInit = true;
-                        }
-
-                        ID3D11Texture2D* decoded = g_Decoder.Decode(buffer.data(), header.frameSize, g_pd3dDeviceContext);
-                        if (decoded) {
-                            ID3D11Texture2D* newTex = g_Converter.ConvertNV12ToBGRA(decoded);
-                            if (newTex && newTex != g_DisplayTexture) {
-                                g_DisplayTexture = newTex;
-                                if (g_DisplaySRV) { g_DisplaySRV->Release(); g_DisplaySRV = nullptr; }
-                                g_pd3dDevice->CreateShaderResourceView(g_DisplayTexture, nullptr, &g_DisplaySRV);
+                            if (!g_ClientInit) {
+                                g_Decoder.Initialize(g_pd3dDevice, 1920, 1080);
+                                g_Converter.Initialize(g_pd3dDevice, 1920, 1080);
+                                g_ClientInit = true;
                             }
+
+                            ID3D11Texture2D* decoded = g_Decoder.Decode(buffer.data(), header.payloadSize, g_pd3dDeviceContext);
+                            if (decoded) {
+                                ID3D11Texture2D* newTex = g_Converter.ConvertNV12ToBGRA(decoded);
+                                if (newTex && newTex != g_DisplayTexture) {
+                                    g_DisplayTexture = newTex;
+                                    if (g_DisplaySRV) { g_DisplaySRV->Release(); g_DisplaySRV = nullptr; }
+                                    g_pd3dDevice->CreateShaderResourceView(g_DisplayTexture, nullptr, &g_DisplaySRV);
+                                }
+                            }
+                        } 
+                        else if (header.packetType == PACKET_TYPE_AUDIO) {
+                            // --- HANDLE AUDIO ---
+                            g_AudioPlay.QueueAudio(buffer.data(), header.payloadSize);
                         }
                     }
                 } else {
                     g_State = AppState::MENU;
                     g_StatusMsg = "Host disconnected.";
-                    if (g_Socket != -1) closesocket(g_Socket);
-                    g_Socket = -1;
+                    closesocket(g_Socket); g_Socket = -1;
+                    break;
                 }
             }
         }
 
-        // --- Rendering ---
+        // --- RENDER ---
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        // 1. Draw Video
         if (g_State == AppState::STREAMING && g_DisplaySRV) {
             RECT rect; GetClientRect(hwnd, &rect);
             float w = (float)(rect.right - rect.left);
             float h = (float)(rect.bottom - rect.top);
             auto drawList = ImGui::GetBackgroundDrawList();
-            
-            // Video Background
             drawList->AddImage((void*)g_DisplaySRV, ImVec2(0,0), ImVec2(w,h));
 
-            // Cursor Overlay
-            // Cursor Overlay - NEW REALISTIC CURSOR
             if (g_RemoteCursor.x != -1) {
-                float scaleX = w / 1920.0f; // Scale assuming 1080p source
+                float scaleX = w / 1920.0f; 
                 float scaleY = h / 1080.0f;
-                
-                float baseX = g_RemoteCursor.x * scaleX;
-                float baseY = g_RemoteCursor.y * scaleY;
-                float cursorSize = 16.0f; // Size of the arrow
-
-                // Define the three points of a standard cursor arrow
-                ImVec2 p1(baseX, baseY); // Tip
-                ImVec2 p2(baseX, baseY + cursorSize);
-                ImVec2 p3(baseX + cursorSize * 0.75f, baseY + cursorSize * 0.75f);
-
-                // 1. Draw White Filled Arrow
-                drawList->AddTriangleFilled(p1, p2, p3, IM_COL32(255, 255, 255, 255));
-                
-                // 2. Draw Black Outline (for visibility on light backgrounds)
-                drawList->AddTriangle(p1, p2, p3, IM_COL32(0, 0, 0, 255), 1.5f);
-            }       
+                float bx = g_RemoteCursor.x * scaleX;
+                float by = g_RemoteCursor.y * scaleY;
+                float cs = 16.0f;
+                drawList->AddTriangleFilled(ImVec2(bx, by), ImVec2(bx, by+cs), ImVec2(bx+cs*0.75f, by+cs*0.75f), IM_COL32(255,255,255,255));
+                drawList->AddTriangle(ImVec2(bx, by), ImVec2(bx, by+cs), ImVec2(bx+cs*0.75f, by+cs*0.75f), IM_COL32(0,0,0,255), 1.5f);
+            }
         }
 
+        // 2. Draw UI
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(350, 250), ImGuiCond_FirstUseEver);
         
         ImGui::Begin("Control Panel");
         ImGui::Text("Status: %s", g_StatusMsg.c_str());
         ImGui::Separator();
 
         if (g_State == AppState::MENU) {
-            if (ImGui::Button("HOST STREAM", ImVec2(280, 50))) {
+            // --- AUDIO SELECTOR ---
+            ImGui::Text("Audio Source:");
+            if (!g_AudioDevices.empty()) {
+                if (ImGui::BeginCombo("##AudioDev", g_AudioDevices[g_SelectedAudioIndex].name.c_str())) {
+                    for (int i = 0; i < g_AudioDevices.size(); i++) {
+                        bool isSelected = (g_SelectedAudioIndex == i);
+                        if (ImGui::Selectable(g_AudioDevices[i].name.c_str(), isSelected)) {
+                            g_SelectedAudioIndex = i;
+                        }
+                        if (isSelected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            } else {
+                ImGui::TextDisabled("No Audio Devices Found");
+            }
+            ImGui::Separator();
+            // ---------------------
+
+            if (ImGui::Button("HOST STREAM", ImVec2(330, 50))) {
                 g_StatusMsg = "Waiting for client...";
+                
                 std::thread hostThread([&]() {
                     int clientSock = -1;
                     if (g_Net.WaitForReceiver(clientSock)) {
                         g_Socket = clientSock;
                         g_State = AppState::HOSTING;
                         g_StatusMsg = "Streaming...";
+                        
+                        // Start Video
                         static bool encInit = false;
                         g_Capturer.Initialize();
                         g_Capturer.Start([&](ID3D11Texture2D* tex, ID3D11DeviceContext* ctx, POINT pt) {
@@ -245,17 +273,26 @@ int main(int, char**) {
                                 encInit = true;
                             }
                             g_Encoder.EncodeFrame(tex, ctx, [&](const uint8_t* data, size_t size) {
-                                g_Net.SendFrame(g_Socket, data, size, pt.x, pt.y);
+                                g_Net.SendPacket(g_Socket, PACKET_TYPE_VIDEO, data, size, pt.x, pt.y);
                                 g_BytesSent += size;
                             });
                         });
+
+                        // Start Audio
+                        if (!g_AudioDevices.empty()) {
+                            g_AudioCap.Start(g_AudioDevices[g_SelectedAudioIndex].id, [&](const uint8_t* data, size_t size) {
+                                g_Net.SendPacket(g_Socket, PACKET_TYPE_AUDIO, data, size);
+                            });
+                        }
+
                     } else {
                         g_StatusMsg = "Hosting failed.";
                     }
                 });
                 hostThread.detach();
             }
-            if (ImGui::Button("JOIN STREAM", ImVec2(280, 50))) {
+
+            if (ImGui::Button("JOIN STREAM", ImVec2(330, 50))) {
                 g_StatusMsg = "Searching...";
                 g_State = AppState::CONNECTING; 
             }
@@ -264,14 +301,14 @@ int main(int, char**) {
             ImGui::Text("Sent: %.2f MB", g_BytesSent / 1024.0f / 1024.0f);
             if (ImGui::Button("Stop Hosting")) {
                 g_Capturer.Stop();
+                g_AudioCap.Stop(); // Stop Audio
                 g_State = AppState::MENU;
                 g_BytesSent = 0;
             }
         }
         else if (g_State == AppState::STREAMING) {
             if (ImGui::Button("Disconnect")) {
-                closesocket(g_Socket);
-                g_Socket = -1;
+                closesocket(g_Socket); g_Socket = -1;
                 g_State = AppState::MENU;
             }
         }
@@ -286,11 +323,7 @@ int main(int, char**) {
         g_pSwapChain->Present(1, 0);
     }
 
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-    CleanupDeviceD3D();
-    DestroyWindow(hwnd);
-    UnregisterClass(wc.lpszClassName, wc.hInstance);
+    ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+    CleanupDeviceD3D(); DestroyWindow(hwnd); UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 0;
 }

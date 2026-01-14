@@ -12,10 +12,15 @@
 #define DISCOVERY_PORT 8888
 #define STREAM_PORT 8889
 
+// Packet Types
+#define PACKET_TYPE_VIDEO 0
+#define PACKET_TYPE_AUDIO 1
+
 struct PacketHeader {
-    uint32_t frameSize;
-    int32_t  cursorX;
-    int32_t  cursorY;
+    uint32_t packetType; // 0=Video, 1=Audio
+    uint32_t payloadSize;
+    int32_t  cursorX;    // Ignored for Audio
+    int32_t  cursorY;    // Ignored for Audio
 };
 
 class NetworkManager {
@@ -30,7 +35,6 @@ public:
         WSACleanup();
     }
 
-    // Check if socket has data waiting (Non-Blocking)
     bool IsDataAvailable(int sock) {
         if (sock == -1) return false;
         fd_set readSet;
@@ -40,7 +44,6 @@ public:
         return select(0, &readSet, nullptr, nullptr, &timeout) > 0;
     }
 
-    // SENDER: Wait for Client (With Error Checking)
     bool WaitForReceiver(int& outClientSocket) {
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listenSock == INVALID_SOCKET) return false;
@@ -51,28 +54,21 @@ public:
         serverAddr.sin_port = htons(STREAM_PORT);
         
         if (bind(listenSock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-            std::cerr << "[Network] Bind failed. Port " << STREAM_PORT << " in use." << std::endl;
             closesocket(listenSock);
             return false;
         }
-
-        if (listen(listenSock, 1) == SOCKET_ERROR) {
-            closesocket(listenSock);
-            return false;
-        }
+        listen(listenSock, 1);
 
         std::atomic<bool> searching = true;
         std::thread broadcaster([&]() {
             SOCKET udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             BOOL broadcast = TRUE;
             setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
-
             sockaddr_in broadcastAddr = {};
             broadcastAddr.sin_family = AF_INET;
             broadcastAddr.sin_port = htons(DISCOVERY_PORT);
             broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
             const char* msg = "DISCOVER_DXGI_STREAM";
-            
             while (searching) {
                 sendto(udpSock, msg, (int)strlen(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -93,40 +89,36 @@ public:
         return true;
     }
 
-    // SENDER: Send Data + Cursor
-    void SendFrame(int clientSock, const uint8_t* data, size_t size, int x, int y) {
+    // UPDATED: Now accepts packetType
+    void SendPacket(int clientSock, uint32_t type, const uint8_t* data, size_t size, int x = -1, int y = -1) {
         if (clientSock == INVALID_SOCKET) return;
 
         PacketHeader header;
-        header.frameSize = htonl((uint32_t)size);
-        header.cursorX   = htonl(x);
-        header.cursorY   = htonl(y);
+        header.packetType  = htonl(type);
+        header.payloadSize = htonl((uint32_t)size);
+        header.cursorX     = htonl(x);
+        header.cursorY     = htonl(y);
         
-        int sent = send((SOCKET)clientSock, (char*)&header, sizeof(header), 0);
-        if (sent <= 0) return;
-
+        send((SOCKET)clientSock, (char*)&header, sizeof(header), 0);
+        
         int totalSent = 0;
         while (totalSent < (int)size) {
-            sent = send((SOCKET)clientSock, (const char*)(data + totalSent), (int)(size - totalSent), 0);
+            int sent = send((SOCKET)clientSock, (const char*)(data + totalSent), (int)(size - totalSent), 0);
             if (sent <= 0) break;
             totalSent += sent;
         }
     }
 
-    // RECEIVER: Discovery + Connect (With Timeouts)
     bool FindAndConnect(int& outServerSocket) {
         SOCKET udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         DWORD udpTimeout = 2000;
         setsockopt(udpSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&udpTimeout, sizeof(udpTimeout));
-
         sockaddr_in recvAddr = {};
         recvAddr.sin_family = AF_INET;
         recvAddr.sin_port = htons(DISCOVERY_PORT);
         recvAddr.sin_addr.s_addr = INADDR_ANY;
-
         if (bind(udpSock, (sockaddr*)&recvAddr, sizeof(recvAddr)) == SOCKET_ERROR) {
-            closesocket(udpSock);
-            return false;
+            closesocket(udpSock); return false;
         }
 
         char buffer[1024];
@@ -136,30 +128,13 @@ public:
         closesocket(udpSock);
 
         if (len > 0) {
-            std::string msg(buffer, len);
-            if (msg.find("DISCOVER_DXGI_STREAM") != std::string::npos) {
-                SOCKET tcpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                senderAddr.sin_port = htons(STREAM_PORT);
-
-                u_long mode = 1; // Non-blocking
-                ioctlsocket(tcpSock, FIONBIO, &mode);
-                connect(tcpSock, (sockaddr*)&senderAddr, sizeof(senderAddr));
-
-                fd_set writeSet;
-                FD_ZERO(&writeSet);
-                FD_SET(tcpSock, &writeSet);
-                timeval timeout = { 3, 0 }; // 3s Timeout
-
-                if (select(0, NULL, &writeSet, NULL, &timeout) > 0) {
-                    mode = 0; // Blocking
-                    ioctlsocket(tcpSock, FIONBIO, &mode);
-                    BOOL nodelay = TRUE;
-                    setsockopt(tcpSock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-                    outServerSocket = (int)tcpSock;
-                    return true;
-                }
-                closesocket(tcpSock);
-            }
+            SOCKET tcpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            senderAddr.sin_port = htons(STREAM_PORT);
+            connect(tcpSock, (sockaddr*)&senderAddr, sizeof(senderAddr));
+            BOOL nodelay = TRUE;
+            setsockopt(tcpSock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+            outServerSocket = (int)tcpSock;
+            return true;
         }
         return false;
     }
@@ -172,9 +147,10 @@ public:
             if (ret <= 0) return false;
             bytesReceived += ret;
         }
-        outHeader.frameSize = ntohl(outHeader.frameSize);
-        outHeader.cursorX   = ntohl(outHeader.cursorX);
-        outHeader.cursorY   = ntohl(outHeader.cursorY);
+        outHeader.packetType  = ntohl(outHeader.packetType);
+        outHeader.payloadSize = ntohl(outHeader.payloadSize);
+        outHeader.cursorX     = ntohl(outHeader.cursorX);
+        outHeader.cursorY     = ntohl(outHeader.cursorY);
         return true;
     }
 
